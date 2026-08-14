@@ -7,8 +7,7 @@
 """
 
 import calendar
-import uuid
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -204,6 +203,39 @@ def snapshot_sector_history(weights: dict) -> None:
 # 네이버 금융: 종목명 → 종목코드 자동 검색 + 시세 조회
 # ------------------------------------------------------------------ #
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def get_current_prices_for_names(names: list[str]) -> dict:
+    """종목명 리스트의 현재가 조회. 보유 여부와 무관 — 청산된 종목 추적용."""
+    name_to_code = {}
+    for n in names:
+        code = resolve_code(n)
+        if code:
+            name_to_code[n] = code
+    quotes = fetch_quotes(list(name_to_code.values()))
+    result = {}
+    for n, code in name_to_code.items():
+        if code in quotes:
+            result[n] = quotes[code]["price"]
+    return result
+
+
+def get_closed_out_last_sells(holdings_df: pd.DataFrame, tx_df: pd.DataFrame) -> pd.DataFrame:
+    """현재 보유 중이 아닌(=완전히 매도한) 종목들의 마지막 매도일/매도가."""
+    sell_tx = tx_df[tx_df["구분"] == "매도"].copy()
+    if sell_tx.empty:
+        return pd.DataFrame(columns=["종목명", "매도일", "매도가"])
+    sell_tx["단가"] = pd.to_numeric(sell_tx["단가"], errors="coerce")
+    held_names = set(holdings_df["종목명"].tolist())
+    sell_tx = sell_tx[~sell_tx["종목명"].isin(held_names)]
+    sell_tx = sell_tx[sell_tx["단가"].notna() & (sell_tx["단가"] > 0)]
+    if sell_tx.empty:
+        return pd.DataFrame(columns=["종목명", "매도일", "매도가"])
+    sell_tx = sell_tx.sort_values(["종목명", "날짜", "id"])
+    last = sell_tx.groupby("종목명", as_index=False).tail(1)[["종목명", "날짜", "단가"]]
+    last = last.rename(columns={"날짜": "매도일", "단가": "매도가"})
+    return last.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def resolve_code(name: str):
     name = (name or "").strip()
     if not name:
@@ -338,52 +370,6 @@ def compute_sector_weights(df: pd.DataFrame) -> dict:
 
 
 # ------------------------------------------------------------------ #
-# 거래 반영 (매수/매도)
-# ------------------------------------------------------------------ #
-def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str, qty: float, price: float):
-    holdings = holdings.copy()
-    realized = None
-    match = holdings.index[holdings["종목명"] == name]
-
-    if kind == "매수":
-        cost = qty * price
-        state["cash"] -= cost
-        if len(match):
-            i = match[0]
-            old_qty = float(holdings.loc[i, "수량"])
-            old_avg = float(holdings.loc[i, "평단가"])
-            new_qty = old_qty + qty
-            new_avg = (old_qty * old_avg + cost) / new_qty if new_qty else 0
-            holdings.loc[i, "수량"] = new_qty
-            holdings.loc[i, "평단가"] = new_avg
-            if not holdings.loc[i, "현재가"] or float(holdings.loc[i, "현재가"]) == 0:
-                holdings.loc[i, "현재가"] = price
-        else:
-            new_row = {c: "" for c in HOLD_COLUMNS}
-            new_row.update({"종목명": name, "종목코드": "", "섹터": "미분류",
-                             "수량": qty, "평단가": price, "현재가": price,
-                             "등락률": 0, "업데이트시각": now_kst_str()})
-            holdings = pd.concat([holdings, pd.DataFrame([new_row])], ignore_index=True)
-    else:  # 매도
-        proceeds = qty * price
-        state["cash"] += proceeds
-        if len(match):
-            i = match[0]
-            old_qty = float(holdings.loc[i, "수량"])
-            old_avg = float(holdings.loc[i, "평단가"])
-            realized = (price - old_avg) * qty
-            new_qty = old_qty - qty
-            if new_qty <= 0:
-                holdings = holdings.drop(index=i).reset_index(drop=True)
-            else:
-                holdings.loc[i, "수량"] = new_qty
-        else:
-            realized = 0.0
-
-    return holdings, state, realized
-
-
-# ------------------------------------------------------------------ #
 # 페이지 설정
 # ------------------------------------------------------------------ #
 st.set_page_config(page_title="Meritz Orchestra", page_icon="◆", layout="centered")
@@ -442,6 +428,13 @@ st.markdown(f"""
     .sector-bar-pct {{ font-size:12px; color:{T['muted']}; width:64px; flex-shrink:0; text-align:right; font-family: ui-monospace, monospace; white-space:nowrap; }}
     .sector-bar-pct .cur {{ font-weight:700; color:{T['text']}; }}
     .sector-bar-pct .delta {{ margin-left:3px; }}
+    .sector-stock-names {{ font-size:10.5px; color:{T['muted2']}; margin:2px 0 0 2px; }}
+
+    .updown-row {{ display:flex; align-items:center; gap:8px; padding:7px 2px; border-bottom:1px solid {T['border']}; font-size:12.5px; }}
+    .updown-row:last-child {{ border-bottom:none; }}
+    .updown-row .name {{ font-weight:700; color:{T['text']}; flex:1; }}
+    .updown-row .pct {{ font-weight:700; font-family: ui-monospace, monospace; width:62px; text-align:right; }}
+    .updown-row .detail {{ font-size:11px; color:{T['muted']}; font-family: ui-monospace, monospace; width:118px; text-align:right; }}
 
 
     .stock-card {{ background:{T['card']}; border:1px solid {T['border']}; border-radius:12px; padding:10px 16px; margin-bottom:7px; }}
@@ -633,20 +626,6 @@ st.markdown(f"""
         padding-left: 0.2rem !important;
         padding-right: 0.2rem !important;
     }}
-    /* ---- 탭 바 우측 새로고침 아이콘 버튼 ---- */
-    div.st-key-header_refresh_btn > div > button {{
-        border-radius: 999px !important;
-        width: 30px !important;
-        height: 30px !important;
-        min-height: 30px !important;
-        padding: 0 !important;
-        font-size: 15px !important;
-        line-height: 1 !important;
-        display: flex !important;
-        align-items: center;
-        justify-content: center;
-        margin-left: auto;
-    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -689,17 +668,16 @@ holdings = load_holdings()
 state = load_state()
 tx = load_transactions()
 
-col_tabs_spacer, col_refresh_icon = st.columns([6, 1])
-with col_refresh_icon:
-    header_refresh_clicked = st.button("⟳", key="header_refresh_btn", help="시세 새로고침")
+top_l, top_r = st.columns([5, 2])
+with top_r:
+    refresh_clicked_top = st.button("시세 새로고침", use_container_width=True, key="refresh_btn_top")
 
-if header_refresh_clicked:
+if refresh_clicked_top:
     with st.spinner("종목명으로 시세를 찾는 중..."):
         holdings = refresh_all_prices(holdings)
-        df_r, stock_val_r, total_assets_r, unreal_r = compute_metrics(holdings, state["cash"])
-        adjusted_r = total_assets_r + unreal_r
-        snapshot_history(total_assets_r, adjusted_r)
-        snapshot_sector_history(compute_sector_weights(df_r))
+        df_top, stock_val_top, total_assets_top, unreal_top = compute_metrics(holdings, state["cash"])
+        snapshot_history(total_assets_top, total_assets_top + unreal_top)
+        snapshot_sector_history(compute_sector_weights(df_top))
     st.rerun()
 
 tab_port, tab_tx = st.tabs(["포트폴리오", "거래 기록"])
@@ -893,6 +871,57 @@ with tab_port:
                     else:
                         st.info("시세 새로고침 또는 거래 기록을 하면 그날의 섹터 비중이 저장되어 추이가 쌓입니다.")
 
+    # ---- Up/Down: 청산 종목 추적 ----
+    with st.expander("Up/Down", expanded=False):
+        updown_mode = st.radio("모드", ["DOWN", "UP"], horizontal=True,
+                                label_visibility="collapsed", key="updown_mode")
+
+        if st.button("새로고침", key="updown_refresh", use_container_width=True):
+            closed = get_closed_out_last_sells(holdings, tx)
+            results = []
+            if not closed.empty:
+                with st.spinner("청산 종목 현재가 조회 중..."):
+                    prices = get_current_prices_for_names(closed["종목명"].tolist())
+                for _, row in closed.iterrows():
+                    cp = prices.get(row["종목명"])
+                    if cp is None:
+                        continue
+                    pct = (cp - row["매도가"]) / row["매도가"] * 100
+                    results.append({
+                        "종목명": row["종목명"], "매도일": row["매도일"],
+                        "매도가": row["매도가"], "현재가": cp, "pct": pct,
+                    })
+            st.session_state["updown_results"] = results
+            st.session_state["updown_checked_at"] = now_kst_str()
+            st.rerun()
+
+        updown_results = st.session_state.get("updown_results")
+        updown_checked_at = st.session_state.get("updown_checked_at")
+
+        if updown_results is None:
+            st.caption("새로고침을 누르면 청산(완전 매도)된 종목의 현재가를 마지막 매도가와 비교합니다.")
+        else:
+            if updown_checked_at:
+                st.caption(f"마지막 조회: {updown_checked_at}")
+            threshold = 3.0
+            if updown_mode == "DOWN":
+                filtered = sorted([r for r in updown_results if r["pct"] <= -threshold], key=lambda r: r["pct"])
+                updown_color = DOWN_COLOR
+            else:
+                filtered = sorted([r for r in updown_results if r["pct"] >= threshold], key=lambda r: -r["pct"])
+                updown_color = UP_COLOR
+
+            if not filtered:
+                st.caption("조건에 해당하는 종목이 없습니다.")
+            else:
+                rows_html = "".join(
+                    f'<div class="updown-row"><span class="name">{r["종목명"]}</span>'
+                    f'<span class="pct" style="color:{updown_color}">{"+" if r["pct"] >= 0 else ""}{r["pct"]:.1f}%</span>'
+                    f'<span class="detail">{r["매도가"]:,.0f} → {r["현재가"]:,.0f}</span></div>'
+                    for r in filtered
+                )
+                st.markdown(rows_html, unsafe_allow_html=True)
+
     # ---- 종목별 보유현황 ----
     SORT_OPTIONS = {"비중": "weight", "섹터": "sector", "현재가": "price",
                      "평가금액": "valuation", "손익": "profit"}
@@ -1035,66 +1064,6 @@ with tab_tx:
         """, unsafe_allow_html=True)
     else:
         st.info("시세를 새로고침하면 그날의 자산 스냅샷이 하나씩 쌓여 그래프가 그려집니다.")
-
-    st.divider()
-
-    # ---- 새 거래 기록 ----
-    st.markdown("##### 새 거래 기록하기")
-
-    existing_names = sorted(holdings["종목명"].dropna().astype(str).replace("", pd.NA).dropna().unique().tolist())
-    name_options = existing_names + ["기타 (직접 입력)"]
-
-    if "tx_selected_name" not in st.session_state or st.session_state.tx_selected_name not in name_options:
-        st.session_state.tx_selected_name = name_options[0] if name_options else ""
-
-    with st.popover(f"종목명: {st.session_state.tx_selected_name or '선택'}", use_container_width=True):
-        st.caption("보유 종목 중에서 선택하거나, 맨 아래 '기타'를 골라 새 종목명을 입력하세요.")
-        picked = st.radio("종목 목록", name_options, label_visibility="collapsed", key="tx_name_radio_inner")
-        st.session_state.tx_selected_name = picked
-
-    name_choice = st.session_state.tx_selected_name
-    if name_choice == "기타 (직접 입력)":
-        tx_name_input = st.text_input("새 종목명", placeholder="예: 삼성전자", key="tx_name_custom")
-    else:
-        tx_name_input = name_choice
-
-    with st.form("tx_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            tx_date = st.date_input("날짜", value=date.today())
-        with c2:
-            tx_kind = st.radio("구분", ["매수", "매도"], horizontal=True)
-            tx_qty = st.number_input("수량", min_value=0, step=1)
-        tx_price = st.number_input("단가", min_value=0, step=100)
-        tx_memo = st.text_input("메모 (선택)", placeholder="예: 분할매수 1차")
-        submitted = st.form_submit_button("기록 저장", use_container_width=True)
-
-    if submitted:
-        tx_name = (tx_name_input or "").strip()
-        if not tx_name or tx_qty <= 0 or tx_price <= 0:
-            st.error("종목명, 수량, 단가를 정확히 입력해주세요.")
-        else:
-            holdings2, state2, realized = apply_transaction(holdings, state, tx_name.strip(), tx_kind, tx_qty, tx_price)
-            new_row = {
-                "id": str(uuid.uuid4())[:8], "날짜": tx_date.strftime("%Y-%m-%d"),
-                "종목명": tx_name.strip(), "구분": tx_kind, "수량": tx_qty, "단가": tx_price,
-                "실현손익": realized if realized is not None else "", "메모": tx_memo, "정산반영": True,
-            }
-            tx2 = pd.concat([tx, pd.DataFrame([new_row])], ignore_index=True)
-
-            save_holdings(holdings2)
-            save_state(state2)
-            save_transactions(tx2)
-
-            df4, val4, total4, unreal4 = compute_metrics(holdings2, state2["cash"])
-            snapshot_history(total4, total4 + unreal4)
-            snapshot_sector_history(compute_sector_weights(df4))
-
-            msg = f"{tx_kind} 기록 완료: {tx_name} {tx_qty:.0f}주 @ {tx_price:,.0f}원"
-            if realized is not None:
-                msg += f" (실현손익 {realized:+,.0f}원)"
-            st.success(msg)
-            st.rerun()
 
     st.divider()
 
